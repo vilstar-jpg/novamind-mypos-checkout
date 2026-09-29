@@ -74,7 +74,7 @@ const products = {
   offers: {
     name: 'Система за запитвания и оферти',
     amount: 199.00,
-    shopifyVariantId: '59985549459840',
+    shopifyVariantId: '58710232039808',
   },
 };
 
