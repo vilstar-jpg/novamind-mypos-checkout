@@ -1,0 +1,20 @@
+{
+  "name": "mypos-checkout",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^8.3.0"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.4",
+    "express": "^5.2.1",
+    "mypos-embedded-checkout": "^1.4.4",
+    "mypos-online-checkout": "^0.1.1"
+  }
+}
