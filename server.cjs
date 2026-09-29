@@ -61,7 +61,7 @@ const products = {
 
   calls: {
     name: 'AI Анализ на Обаждания',
-    amount: 89.00,
+    amount: 149.00,
     shopifyVariantId: '59985549459840',
   },
 
