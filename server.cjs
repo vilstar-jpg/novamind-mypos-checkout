@@ -9,6 +9,8 @@ app.set('trust proxy', true);
 
 const PORT = process.env.PORT || 3000;
 const MYPOS_URL = 'https://www.mypos.com/vmp/checkout';
+const MERCHANT_URL = (process.env.MERCHANT_URL || 'https://novamind-ai.store').replace(/\/$/, '');
+const NOTIFY_URL = (process.env.MYPOS_NOTIFY_URL || 'https://novamind-mypos-checkout-wvkt.onrender.com/mypos/notify').replace(/\/$/, '');
 
 // ======================================================
 // myPOS CONFIGURATION PACK
@@ -66,6 +68,10 @@ const products = {
     amount: 199.00,
   },
 };
+
+// Pending requests are intentionally kept separate from browser redirects.
+// The callback is the only place where a payment can become confirmed.
+const pendingOrders = new Map();
 
 // ======================================================
 // HELPERS
@@ -169,12 +175,6 @@ app.get('/pay/:product', (req, res) => {
       return res.status(404).send('Product not found');
     }
 
-    const protocol =
-      req.headers['x-forwarded-proto'] || req.protocol;
-
-    const baseUrl =
-      `${protocol}://${req.get('host')}`;
-
     const orderId =
       `NM-${req.params.product}-${Date.now()}`;
 
@@ -197,9 +197,12 @@ app.get('/pay/:product', (req, res) => {
 
       OrderID: orderId,
 
-      URL_OK: `${baseUrl}/success`,
-      URL_Cancel: `${baseUrl}/cancel`,
-      URL_Notify: `${baseUrl}/mypos/notify`,
+      // Redirects belong to the approved merchant website domain.
+      URL_OK: MERCHANT_URL,
+      URL_Cancel: MERCHANT_URL,
+      // Notify is a public HTTPS server-to-server endpoint and may be hosted
+      // separately from the merchant website.
+      URL_Notify: NOTIFY_URL,
 
       CardTokenRequest: '0',
 
@@ -217,6 +220,13 @@ app.get('/pay/:product', (req, res) => {
       Currency_1: 'EUR',
       Amount_1: amount,
     };
+
+    pendingOrders.set(orderId, {
+      product: req.params.product,
+      amount,
+      currency: 'EUR',
+      createdAt: Date.now(),
+    });
 
     params.Signature =
       createSignature(params);
@@ -351,6 +361,36 @@ app.post(
           .send('INVALID');
       }
 
+      if (String(data.IPCmethod) !== 'IPCPurchaseNotify') {
+        console.error('❌ Unexpected myPOS notification method');
+        return res.status(400).type('text/plain').send('INVALID');
+      }
+
+      const pending = pendingOrders.get(data.OrderID);
+      if (!pending) {
+        console.error('❌ Unknown myPOS OrderID');
+        return res.status(409).type('text/plain').send('INVALID');
+      }
+
+      if (
+        String(data.Currency) !== pending.currency ||
+        String(data.Amount) !== pending.amount
+      ) {
+        console.error('❌ myPOS amount/currency mismatch');
+        return res.status(409).type('text/plain').send('INVALID');
+      }
+
+      if (String(data.Status) !== '0') {
+        pendingOrders.delete(data.OrderID);
+        console.error('❌ myPOS payment declined:', data.Status, data.StatusMsg || '');
+        return res.status(200).type('text/plain').send('OK');
+      }
+
+      if (!data.IPC_Trnref) {
+        console.error('❌ Missing myPOS transaction reference');
+        return res.status(409).type('text/plain').send('INVALID');
+      }
+
       console.log(
         '✅ MYPOS PAYMENT CONFIRMED'
       );
@@ -370,6 +410,8 @@ app.post(
         'Transaction:',
         data.IPC_Trnref
       );
+
+      pendingOrders.delete(data.OrderID);
 
       // ВАЖНО:
       // Следващата стъпка тук ще бъде:
