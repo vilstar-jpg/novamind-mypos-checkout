@@ -78,6 +78,10 @@ const products = {
   },
 };
 
+// Temporary safety net while the Supabase schema cache is being repaired.
+// Verified callbacks still require the myPOS signature and amount checks.
+const pendingOrders = new Map();
+
 // ======================================================
 // HELPERS
 // ======================================================
@@ -113,7 +117,8 @@ async function supabaseRequest(path, options = {}) {
 }
 
 async function createPaymentIntent(orderId, productKey, product, amount) {
-  const rows = await supabaseRequest('payment_intents', {
+  try {
+    const rows = await supabaseRequest('payment_intents', {
     method: 'POST',
     headers: { Prefer: 'return=representation,resolution=ignore-duplicates' },
     body: JSON.stringify({
@@ -124,24 +129,49 @@ async function createPaymentIntent(orderId, productKey, product, amount) {
       amount,
       currency: 'EUR',
     }),
-  });
-  if (rows?.[0]) return rows[0];
-  const existing = await supabaseRequest(`payment_intents?select=*&mypos_order_id=eq.${encodeURIComponent(orderId)}&limit=1`);
-  if (!existing?.[0]) throw new Error('Could not create or load payment intent');
-  return existing[0];
+    });
+    if (rows?.[0]) return rows[0];
+    const existing = await supabaseRequest(`payment_intents?select=*&mypos_order_id=eq.${encodeURIComponent(orderId)}&limit=1`);
+    if (!existing?.[0]) throw new Error('Could not create or load payment intent');
+    return existing[0];
+  } catch (error) {
+    console.error('⚠️ Supabase persistence unavailable; using temporary pending order:', error.message);
+    const fallback = {
+      mypos_order_id: orderId,
+      product_key: productKey,
+      product_title: product.name,
+      shopify_variant_id: product.shopifyVariantId,
+      amount,
+      currency: 'EUR',
+      status: 'PENDING',
+      retry_count: 0,
+    };
+    pendingOrders.set(orderId, fallback);
+    return fallback;
+  }
 }
 
 async function updatePaymentIntent(orderId, patch) {
-  return supabaseRequest(`payment_intents?mypos_order_id=eq.${encodeURIComponent(orderId)}`, {
-    method: 'PATCH',
-    headers: { Prefer: 'return=representation' },
-    body: JSON.stringify(patch),
-  });
+  try {
+    return await supabaseRequest(`payment_intents?mypos_order_id=eq.${encodeURIComponent(orderId)}`, {
+      method: 'PATCH',
+      headers: { Prefer: 'return=representation' },
+      body: JSON.stringify(patch),
+    });
+  } catch (error) {
+    const pending = pendingOrders.get(orderId);
+    if (pending) Object.assign(pending, patch);
+    return pending ? [pending] : [];
+  }
 }
 
 async function loadPaymentIntent(orderId) {
-  const rows = await supabaseRequest(`payment_intents?select=*&mypos_order_id=eq.${encodeURIComponent(orderId)}&limit=1`);
-  return rows?.[0] || null;
+  try {
+    const rows = await supabaseRequest(`payment_intents?select=*&mypos_order_id=eq.${encodeURIComponent(orderId)}&limit=1`);
+    return rows?.[0] || pendingOrders.get(orderId) || null;
+  } catch (error) {
+    return pendingOrders.get(orderId) || null;
+  }
 }
 
 async function shopifyAccessToken() {
