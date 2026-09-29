@@ -1,13 +1,18 @@
 require('dotenv').config();
 
 const express = require('express');
-const { MyPOSClient } = require('mypos-online-checkout');
+const crypto = require('crypto');
 
 const app = express();
+
 app.set('trust proxy', true);
-app.use(express.urlencoded({ extended: false }));
 
 const PORT = process.env.PORT || 3000;
+const MYPOS_URL = 'https://www.mypos.com/vmp/checkout';
+
+// ======================================================
+// myPOS CONFIGURATION PACK
+// ======================================================
 
 const pack = process.env.MYPOS_CONFIG_PACK;
 
@@ -16,17 +21,29 @@ if (!pack) {
   process.exit(1);
 }
 
-const config = JSON.parse(
-  Buffer.from(pack.trim(), 'base64').toString('utf8')
-);
+let config;
 
-const mypos = new MyPOSClient({
-  storeId: String(config.sid),
-  keyIndex: Number(config.idx),
-  privateKey: config.pk,
-  publicKey: config.pc,
-  isSandbox: false,
-});
+try {
+  config = JSON.parse(
+    Buffer.from(pack.trim(), 'base64').toString('utf8')
+  );
+} catch (error) {
+  console.error('❌ Configuration Pack не може да бъде прочетен.');
+  process.exit(1);
+}
+
+const requiredConfig = ['sid', 'cn', 'idx', 'pk', 'pc'];
+
+for (const key of requiredConfig) {
+  if (!config[key]) {
+    console.error(`❌ Configuration Pack няма поле: ${key}`);
+    process.exit(1);
+  }
+}
+
+// ======================================================
+// PRODUCTS
+// ======================================================
 
 const products = {
   chatgpt: {
@@ -50,6 +67,10 @@ const products = {
   },
 };
 
+// ======================================================
+// HELPERS
+// ======================================================
+
 function escapeHtml(value) {
   return String(value)
     .replace(/&/g, '&amp;')
@@ -58,15 +79,89 @@ function escapeHtml(value) {
     .replace(/>/g, '&gt;');
 }
 
+// Официалната myPOS логика:
+//
+// 1. concatenate values with "-"
+// 2. Base64 encode
+// 3. RSA SHA-256 sign
+// 4. Base64 signature
+
+function createSignature(params) {
+  const values = Object.values(params).map(value => String(value));
+
+  const joined = values.join('-');
+
+  const base64Data = Buffer
+    .from(joined, 'utf8')
+    .toString('base64');
+
+  const signature = crypto.sign(
+    'RSA-SHA256',
+    Buffer.from(base64Data, 'utf8'),
+    config.pk
+  );
+
+  return signature.toString('base64');
+}
+
+function verifySignature(entries) {
+  const signatureEntry = entries.find(
+    ([key]) => key === 'Signature'
+  );
+
+  if (!signatureEntry) {
+    return false;
+  }
+
+  const receivedSignature = signatureEntry[1];
+
+  const values = entries
+    .filter(([key]) => key !== 'Signature')
+    .map(([, value]) => String(value));
+
+  const joined = values.join('-');
+
+  const base64Data = Buffer
+    .from(joined, 'utf8')
+    .toString('base64');
+
+  return crypto.verify(
+    'RSA-SHA256',
+    Buffer.from(base64Data, 'utf8'),
+    config.pc,
+    Buffer.from(receivedSignature, 'base64')
+  );
+}
+
+// ======================================================
+// HOME
+// ======================================================
+
+app.get('/', (req, res) => {
+  res.send(`
+    <h1>NovaMind Digital</h1>
+    <p>myPOS Checkout backend is online.</p>
+  `);
+});
+
+// ======================================================
+// HEALTH
+// ======================================================
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'NovaMind myPOS Checkout',
+    storeId: String(config.sid),
     environment: 'production',
   });
 });
 
-app.get('/pay/:product', async (req, res) => {
+// ======================================================
+// PAYMENT
+// ======================================================
+
+app.get('/pay/:product', (req, res) => {
   try {
     const product = products[req.params.product];
 
@@ -74,116 +169,304 @@ app.get('/pay/:product', async (req, res) => {
       return res.status(404).send('Product not found');
     }
 
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    const protocol =
+      req.headers['x-forwarded-proto'] || req.protocol;
+
+    const baseUrl =
+      `${protocol}://${req.get('host')}`;
 
     const orderId =
-      'NM-' +
-      req.params.product +
-      '-' +
-      Date.now();
+      `NM-${req.params.product}-${Date.now()}`;
 
-    const fields = await mypos.generateCheckoutFields({
-      orderId,
-      amount: product.amount,
-      currency: 'EUR',
+    const amount =
+      Number(product.amount).toFixed(2);
 
-      urlOk: `${baseUrl}/success`,
-      urlCancel: `${baseUrl}/cancel`,
-      urlNotify: `${baseUrl}/mypos/notify`,
+    // IMPORTANT:
+    // Signature depends on EXACT parameter order.
+    const params = {
+      IPCmethod: 'IPCPurchase',
+      IPCVersion: '1.4',
+      IPCLanguage: 'BG',
 
-      cartItems: [
-        {
-          name: product.name,
-          quantity: 1,
-          price: product.amount,
-        },
-      ],
-    });
+      SID: String(config.sid),
 
-    const inputs = Object.entries(fields)
-      .map(
-        ([key, value]) =>
-          `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`
-      )
-      .join('');
+      WalletNumber: String(config.cn),
+
+      Amount: amount,
+      Currency: 'EUR',
+
+      OrderID: orderId,
+
+      URL_OK: `${baseUrl}/success`,
+      URL_Cancel: `${baseUrl}/cancel`,
+      URL_Notify: `${baseUrl}/mypos/notify`,
+
+      CardTokenRequest: '0',
+
+      KeyIndex: String(config.idx),
+
+      // Customer enters the required information
+      // on the myPOS payment page.
+      PaymentParametersRequired: '2',
+
+      CartItems: '1',
+
+      Article_1: product.name,
+      Quantity_1: '1',
+      Price_1: amount,
+      Currency_1: 'EUR',
+      Amount_1: amount,
+    };
+
+    params.Signature =
+      createSignature(params);
+
+    const inputs =
+      Object.entries(params)
+        .map(([key, value]) => {
+          return `
+            <input
+              type="hidden"
+              name="${escapeHtml(key)}"
+              value="${escapeHtml(value)}"
+            >
+          `;
+        })
+        .join('');
 
     res.send(`
       <!doctype html>
-      <html>
+
+      <html lang="bg">
+
       <head>
         <meta charset="utf-8">
+
+        <meta
+          name="viewport"
+          content="width=device-width, initial-scale=1"
+        >
+
         <title>NovaMind Digital – myPOS</title>
       </head>
 
       <body>
-        <p>Пренасочваме те към защитеното плащане на myPOS...</p>
+
+        <p>
+          Пренасочваме те към защитеното
+          плащане на myPOS...
+        </p>
 
         <form
           id="mypos-payment"
           method="POST"
-          action="${escapeHtml(mypos.checkoutUrl)}"
+          action="${MYPOS_URL}"
         >
+
           ${inputs}
+
+          <noscript>
+            <button type="submit">
+              Продължи към myPOS
+            </button>
+          </noscript>
+
         </form>
 
         <script>
-          document.getElementById('mypos-payment').submit();
+          document
+            .getElementById('mypos-payment')
+            .submit();
         </script>
+
       </body>
+
       </html>
     `);
 
   } catch (error) {
-    console.error(error);
-    res.status(500).send('Payment initialization failed');
+
+    console.error(
+      '❌ Payment initialization:',
+      error.name,
+      error.message
+    );
+
+    res.status(500).json({
+      ok: false,
+      error: error.name,
+      message: error.message,
+    });
   }
 });
 
-app.post('/mypos/notify', async (req, res) => {
-  try {
-    const params = {};
+// ======================================================
+// myPOS SERVER-TO-SERVER NOTIFICATION
+// ======================================================
 
-    for (const [key, value] of Object.entries(req.body)) {
-      params[key] = String(value);
-    }
+app.post(
+  '/mypos/notify',
 
-    const result =
-      await mypos.validateNotification(params);
+  express.text({
+    type: '*/*',
+  }),
 
-    if (result.success) {
+  (req, res) => {
+
+    try {
+
+      const params =
+        new URLSearchParams(req.body);
+
+      const entries =
+        Array.from(params.entries());
+
+      const data =
+        Object.fromEntries(entries);
+
+      if (!verifySignature(entries)) {
+
+        console.error(
+          '❌ INVALID myPOS SIGNATURE'
+        );
+
+        return res
+          .status(403)
+          .type('text/plain')
+          .send('INVALID');
+      }
+
+      if (
+        String(data.SID) !==
+        String(config.sid)
+      ) {
+
+        console.error(
+          '❌ Wrong Store ID'
+        );
+
+        return res
+          .status(403)
+          .type('text/plain')
+          .send('INVALID');
+      }
+
       console.log(
-        '✅ MYPOS PAYMENT CONFIRMED:',
-        result.data.orderId,
-        result.data.amount,
-        result.data.currency
+        '✅ MYPOS PAYMENT CONFIRMED'
       );
-    } else {
+
+      console.log(
+        'Order:',
+        data.OrderID
+      );
+
+      console.log(
+        'Amount:',
+        data.Amount,
+        data.Currency
+      );
+
+      console.log(
+        'Transaction:',
+        data.IPC_Trnref
+      );
+
+      // ВАЖНО:
+      // Следващата стъпка тук ще бъде:
+      //
+      // → Shopify order
+      // → mark paid
+      // → Digital Products PDF delivery
+
+      return res
+        .status(200)
+        .type('text/plain')
+        .send('OK');
+
+    } catch (error) {
+
       console.error(
-        '❌ myPOS notification:',
-        result.error
+        '❌ Notify error:',
+        error.message
       );
+
+      return res
+        .status(500)
+        .type('text/plain')
+        .send('ERROR');
     }
-
-    res.status(200).send('OK');
-
-  } catch (error) {
-    console.error('❌ Invalid myPOS notification:', error.message);
-    res.status(403).send('INVALID');
   }
+);
+
+// ======================================================
+// SUCCESS
+// ======================================================
+
+app.all(
+  '/success',
+
+  express.urlencoded({
+    extended: false,
+  }),
+
+  (req, res) => {
+
+    res.send(`
+      <!doctype html>
+
+      <html lang="bg">
+
+      <head>
+        <meta charset="utf-8">
+
+        <title>
+          Плащането е прието
+        </title>
+      </head>
+
+      <body>
+
+        <h1>
+          Благодарим!
+        </h1>
+
+        <p>
+          Плащането е изпратено за
+          потвърждение от myPOS.
+        </p>
+
+        <p>
+          <a href="https://novamind-ai.store">
+            Обратно към NovaMind Digital
+          </a>
+        </p>
+
+      </body>
+
+      </html>
+    `);
+  }
+);
+
+// ======================================================
+// CANCEL
+// ======================================================
+
+app.all('/cancel', (req, res) => {
+
+  res.redirect(
+    'https://novamind-ai.store'
+  );
 });
 
-app.get('/success', (req, res) => {
-  res.send(`
-    <h1>Благодарим за плащането!</h1>
-    <p>Плащането се потвърждава от myPOS.</p>
-    <p><a href="https://novamind-ai.store">Обратно към NovaMind Digital</a></p>
-  `);
-});
-
-app.get('/cancel', (req, res) => {
-  res.redirect('https://novamind-ai.store');
-});
+// ======================================================
+// START
+// ======================================================
 
 app.listen(PORT, () => {
-  console.log(`✅ NovaMind myPOS: http://localhost:${PORT}`);
+
+  console.log(
+    `✅ NovaMind myPOS backend started on port ${PORT}`
+  );
+
 });
