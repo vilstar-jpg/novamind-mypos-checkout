@@ -11,6 +11,11 @@ const PORT = process.env.PORT || 3000;
 const MYPOS_URL = 'https://www.mypos.com/vmp/checkout';
 const MERCHANT_URL = (process.env.MERCHANT_URL || 'https://novamind-ai.store').replace(/\/$/, '');
 const NOTIFY_URL = (process.env.MYPOS_NOTIFY_URL || 'https://novamind-mypos-checkout-wvkt.onrender.com/mypos/notify').replace(/\/$/, '');
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || '';
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || '';
+const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN || 'm4uz7j-hh.myshopify.com';
 
 // ======================================================
 // myPOS CONFIGURATION PACK
@@ -51,27 +56,27 @@ const products = {
   chatgpt: {
     name: 'ChatGPT Настройки за 10 минути',
     amount: 20.00,
+    shopifyVariantId: '58710575939968',
   },
 
   calls: {
     name: 'AI Анализ на Обаждания',
     amount: 89.00,
+    shopifyVariantId: '59985549459840',
   },
 
   clients: {
     name: 'AI Клиентска Машина',
     amount: 97.99,
+    shopifyVariantId: '58710126723456',
   },
 
   offers: {
     name: 'Система за запитвания и оферти',
     amount: 199.00,
+    shopifyVariantId: '59985549459840',
   },
 };
-
-// Pending requests are intentionally kept separate from browser redirects.
-// The callback is the only place where a payment can become confirmed.
-const pendingOrders = new Map();
 
 // ======================================================
 // HELPERS
@@ -83,6 +88,104 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+function requirePersistence() {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Payment persistence is not configured');
+  }
+}
+
+async function supabaseRequest(path, options = {}) {
+  requirePersistence();
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`Supabase ${response.status}: ${text.slice(0, 300)}`);
+  return text ? JSON.parse(text) : null;
+}
+
+async function createPaymentIntent(orderId, productKey, product, amount) {
+  const rows = await supabaseRequest('payment_intents', {
+    method: 'POST',
+    headers: { Prefer: 'return=representation,resolution=ignore-duplicates' },
+    body: JSON.stringify({
+      mypos_order_id: orderId,
+      product_key: productKey,
+      product_title: product.name,
+      shopify_variant_id: product.shopifyVariantId,
+      amount,
+      currency: 'EUR',
+    }),
+  });
+  if (rows?.[0]) return rows[0];
+  const existing = await supabaseRequest(`payment_intents?select=*&mypos_order_id=eq.${encodeURIComponent(orderId)}&limit=1`);
+  if (!existing?.[0]) throw new Error('Could not create or load payment intent');
+  return existing[0];
+}
+
+async function updatePaymentIntent(orderId, patch) {
+  return supabaseRequest(`payment_intents?mypos_order_id=eq.${encodeURIComponent(orderId)}`, {
+    method: 'PATCH',
+    headers: { Prefer: 'return=representation' },
+    body: JSON.stringify(patch),
+  });
+}
+
+async function loadPaymentIntent(orderId) {
+  const rows = await supabaseRequest(`payment_intents?select=*&mypos_order_id=eq.${encodeURIComponent(orderId)}&limit=1`);
+  return rows?.[0] || null;
+}
+
+async function shopifyAccessToken() {
+  if (!SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) throw new Error('Shopify credentials are not configured');
+  const response = await fetch(`https://${SHOPIFY_SHOP_DOMAIN}/admin/oauth/access_token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ grant_type: 'client_credentials', client_id: SHOPIFY_CLIENT_ID, client_secret: SHOPIFY_CLIENT_SECRET }),
+  });
+  const body = await response.json();
+  if (!response.ok || !body.access_token) throw new Error(`Shopify token ${response.status}`);
+  return body.access_token;
+}
+
+async function shopifyGraphql(query, variables) {
+  const token = await shopifyAccessToken();
+  const response = await fetch(`https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2026-01/graphql.json`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
+    body: JSON.stringify({ query, variables }),
+  });
+  const body = await response.json();
+  if (!response.ok || body.errors?.length) throw new Error(`Shopify GraphQL ${response.status}`);
+  return body.data;
+}
+
+async function createAndMarkShopifyOrder(intent, data) {
+  const order = await shopifyGraphql(`mutation CreateOrder($order: OrderCreateOrderInput!) {
+    orderCreate(order: $order) { order { id name } userErrors { field message } }
+  }`, { order: {
+    email: data.Email || data.CustomerEmail || undefined,
+    lineItems: [{ variantId: `gid://shopify/ProductVariant/${intent.shopify_variant_id}`, quantity: 1 }],
+    note: `myPOS OrderID: ${intent.mypos_order_id}`,
+    customAttributes: [{ key: 'mypos_transaction_ref', value: String(data.IPC_Trnref) }],
+  }});
+  const errors = order.orderCreate.userErrors || [];
+  if (errors.length || !order.orderCreate.order?.id) throw new Error(errors.map(x => x.message).join('; ') || 'Shopify order creation failed');
+  const orderId = order.orderCreate.order.id;
+  const paid = await shopifyGraphql(`mutation MarkPaid($input: OrderMarkAsPaidInput!) {
+    orderMarkAsPaid(input: $input) { order { id name } userErrors { field message } }
+  }`, { input: { id: orderId } });
+  const paidErrors = paid.orderMarkAsPaid.userErrors || [];
+  if (paidErrors.length) throw new Error(paidErrors.map(x => x.message).join('; '));
+  return orderId;
 }
 
 // Официалната myPOS логика:
@@ -167,7 +270,7 @@ app.get('/health', (req, res) => {
 // PAYMENT
 // ======================================================
 
-app.get('/pay/:product', (req, res) => {
+app.get('/pay/:product', async (req, res) => {
   try {
     const product = products[req.params.product];
 
@@ -221,12 +324,7 @@ app.get('/pay/:product', (req, res) => {
       Amount_1: amount,
     };
 
-    pendingOrders.set(orderId, {
-      product: req.params.product,
-      amount,
-      currency: 'EUR',
-      createdAt: Date.now(),
-    });
+    await createPaymentIntent(orderId, req.params.product, product, amount);
 
     params.Signature =
       createSignature(params);
@@ -321,7 +419,7 @@ app.post(
     type: '*/*',
   }),
 
-  (req, res) => {
+  async (req, res) => {
 
     try {
 
@@ -366,7 +464,7 @@ app.post(
         return res.status(400).type('text/plain').send('INVALID');
       }
 
-      const pending = pendingOrders.get(data.OrderID);
+      const pending = await loadPaymentIntent(data.OrderID);
       if (!pending) {
         console.error('❌ Unknown myPOS OrderID');
         return res.status(409).type('text/plain').send('INVALID');
@@ -381,7 +479,10 @@ app.post(
       }
 
       if (String(data.Status) !== '0') {
-        pendingOrders.delete(data.OrderID);
+        await updatePaymentIntent(data.OrderID, {
+          status: 'FAILED',
+          last_error: `myPOS declined: ${data.StatusMsg || data.Status}`,
+        });
         console.error('❌ myPOS payment declined:', data.Status, data.StatusMsg || '');
         return res.status(200).type('text/plain').send('OK');
       }
@@ -411,14 +512,35 @@ app.post(
         data.IPC_Trnref
       );
 
-      pendingOrders.delete(data.OrderID);
+      if (pending.status === 'SHOPIFY_CREATED' && pending.shopify_order_id) {
+        return res.status(200).type('text/plain').send('OK');
+      }
 
-      // ВАЖНО:
-      // Следващата стъпка тук ще бъде:
-      //
-      // → Shopify order
-      // → mark paid
-      // → Digital Products PDF delivery
+      await updatePaymentIntent(data.OrderID, {
+        status: 'PAID_VERIFIED',
+        mypos_transaction_ref: String(data.IPC_Trnref),
+        customer_email: data.Email || data.CustomerEmail || null,
+        paid_at: new Date().toISOString(),
+      });
+
+      try {
+        await updatePaymentIntent(data.OrderID, { status: 'SHOPIFY_PENDING' });
+        const shopifyOrderId = await createAndMarkShopifyOrder(pending, data);
+        await updatePaymentIntent(data.OrderID, {
+          status: 'SHOPIFY_CREATED',
+          shopify_order_id: shopifyOrderId,
+          shopify_created_at: new Date().toISOString(),
+          last_error: null,
+        });
+      } catch (shopifyError) {
+        await updatePaymentIntent(data.OrderID, {
+          status: 'SHOPIFY_PENDING',
+          last_error: shopifyError.message,
+          retry_count: Number(pending.retry_count || 0) + 1,
+        });
+        console.error('❌ Shopify fulfillment pending:', shopifyError.message);
+        return res.status(500).type('text/plain').send('RETRY');
+      }
 
       return res
         .status(200)
