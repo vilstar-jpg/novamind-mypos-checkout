@@ -473,6 +473,7 @@ app.post(
 
       if (
         String(data.Currency) !== pending.currency ||
+        Number(data.Amount) !== Number(pending.amount)
       ) {
         console.error('❌ myPOS amount/currency mismatch');
         return res.status(409).type('text/plain').send('INVALID');
